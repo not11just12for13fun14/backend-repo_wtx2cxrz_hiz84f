@@ -2,9 +2,10 @@ import os
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
+from datetime import datetime
 
-from database import create_document, get_documents
+from database import create_document, get_documents, db
 from schemas import Lead
 
 app = FastAPI(title="PAYLOT API", version="1.0.0")
@@ -58,6 +59,87 @@ def list_leads(limit: int = 20):
                 consent=d.get("consent", True)
             ))
         return out
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/dashboard", response_model=Dict[str, Any])
+def dashboard_summary():
+    """Return high-level metrics and a 12-month volume series for the dashboard.
+    If database is unavailable, return safe defaults.
+    """
+    try:
+        if db is None:
+            # Database not configured
+            return {
+                "totals": {
+                    "total_leads": 0,
+                    "total_volume": 0.0,
+                    "conversion_rate": 0.0,
+                    "active_brokers": 0,
+                },
+                "series": [],
+                "note": "Database not configured. Set DATABASE_URL and DATABASE_NAME to enable metrics."
+            }
+
+        # Totals
+        total_leads = db["lead"].count_documents({})
+        # Sum expected_monthly_volume (handle missing/null)
+        agg_volume = list(db["lead"].aggregate([
+            {"$group": {"_id": None, "sum": {"$sum": {"$ifNull": ["$expected_monthly_volume", 0]}}}}
+        ]))
+        total_volume = float(agg_volume[0]["sum"]) if agg_volume else 0.0
+
+        # Active brokers (distinct non-empty)
+        brokers = db["lead"].distinct("broker", {"broker": {"$ne": None, "$ne": ""}})
+        active_brokers = len([b for b in brokers if b])
+
+        # Simple conversion rate heuristic (placeholder): if we had stages we could compute
+        # For now, derive from leads that provided expected_monthly_volume
+        with_volume = db["lead"].count_documents({"expected_monthly_volume": {"$gt": 0}})
+        conversion_rate = (with_volume / total_leads * 100.0) if total_leads else 0.0
+
+        # 12-month volume timeseries by created_at month
+        now = datetime.utcnow()
+        start_dt = datetime(now.year - 1 if now.month != 12 else now.year, ((now.month % 12) + 1), 1)
+        pipeline = [
+            {"$match": {"created_at": {"$gte": start_dt}}},
+            {"$project": {
+                "ym": {"$dateToString": {"format": "%Y-%m", "date": "$created_at"}},
+                "expected_monthly_volume": 1
+            }},
+            {"$group": {
+                "_id": "$ym",
+                "volume": {"$sum": {"$ifNull": ["$expected_monthly_volume", 0]}}
+            }},
+            {"$sort": {"_id": 1}}
+        ]
+        monthly = {d["_id"]: float(d["volume"]) for d in db["lead"].aggregate(pipeline)}
+
+        # Build full 12-month series including months with zero
+        series = []
+        year = now.year
+        month = now.month
+        for i in range(11, -1, -1):
+            y = year
+            m = month - i
+            while m <= 0:
+                y -= 1
+                m += 12
+            key = f"{y:04d}-{m:02d}"
+            series.append({
+                "month": key,
+                "volume": monthly.get(key, 0.0)
+            })
+
+        return {
+            "totals": {
+                "total_leads": total_leads,
+                "total_volume": round(total_volume, 2),
+                "conversion_rate": round(conversion_rate, 2),
+                "active_brokers": active_brokers,
+            },
+            "series": series
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
